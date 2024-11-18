@@ -1,0 +1,15 @@
+    [Unit]
+    Description=python implementation of NOW_MQTT bridge
+    After=network.target
+
+    [Service]
+    SyslogIdentifier=python_espnow_mqtt
+    Environment=PYTHONUNBUFFERED=1
+    Type=simple
+#   ExecStart=/opt/espnow/bin/python3 /opt/espnow/python_espnow_mqtt.py 
+    ExecStart=/bin/bash -c 'cd /opt/espnow && source /opt/espnow/bin/activate && /opt/espnow/bin/python /opt/espnow/python_espnow_mqtt.py'
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+
