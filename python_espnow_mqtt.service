@@ -7,7 +7,7 @@
     Environment=PYTHONUNBUFFERED=1
     Type=simple
 #   ExecStart=/opt/espnow/bin/python3 /opt/espnow/python_espnow_mqtt.py 
-    ExecStart=/bin/bash -c 'cd /opt/espnow && source /opt/espnow/bin/activate && /opt/espnow/bin/python /opt/espnow/python_espnow_mqtt.py'
+    ExecStart=/bin/bash -c 'cd /opt/espnow && source /opt/espnow/bin/activate && /opt/espnow/prep_ip.sh && /opt/espnow/bin/python /opt/espnow/python_espnow_mqtt.py'
     Restart=on-failure
 
     [Install]
