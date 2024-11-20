@@ -63,6 +63,7 @@ def publishNow( from_mac, msg ):
        doc["dev"]["mf"]  = "expressif"
        topic = "%s/binary_sensor/%s/state" % ( tokens[0], tokens[3]  )
        client.publish( topic, tokens[5] , 0)
+       print (topic )
        config_topic = "%s/binary_sensor/%s/%s/config" % ( hassPrefix ,tokens[0], tokens[3]  )
        json_doc = json.dumps(doc) 
        client.publish( config_topic, json_doc , 0)
@@ -94,11 +95,11 @@ def publishNow( from_mac, msg ):
        doc["dev"]["ids"] = macaddr
        topic = "%s/sensor/%s/state" % ( tokens[0], tokens[3]  )
        client.publish( topic, tokens[5] , 0)
+       print (topic )
        config_topic = "%s/sensor/%s/%s/config" % ( hassPrefix,tokens[0], tokens[3]  )
        json_doc = json.dumps(doc) 
        client.publish( config_topic, json_doc , 0)
-  topic = "%s/sensor/%s/state" % ( tokens[0], tokens[3]  )
-  client.publish( topic, tokens[5] , 0)
+
 
 ##  ESP-NOW saw 24:EC:4A:26:91:04 to FF:FF:FF:FF:FF:FF  now55:voltage:measurement:now55_vdd:V:4.05:::2024.10.3:esp32-s3-devkitc-1:sensor:
 ##   {"dev_cla": "temperature", 
