@@ -1,0 +1,383 @@
+#  proof of concept using the new esphome espnow code on esp32s3 
+#      with shtcx sensor and voltage divider to monitoring battery,
+#  showing sending results in form that u-fire gateway [https://github.com/u-fire/ESPHomeComponents/tree/master] can understand. 
+#  it handles  auto-discovery ,etc. ( logging from python_espnow_mqtt included at bottom of file )
+#   i have not attempted to handle the other cases in now_mqtt.cpp (maybe tomorrow)
+
+## Downsides:
+##   logging by uart since it is on batteries
+##   have to connect usb for upload code
+##   need abstracted subroutine  to handle BinarySensor, Text etc.
+##   unpredictable results if the component stanza is not "full" (think state_class, icon, device_class, etc)
+
+
+# This started with code provided by ai for "esphome deepsleep espnow update_interval never averaging values"
+#  references used to correct it to this level:
+#    see https://github.com/u-fire/ESPHomeComponents/blob/master/esphome/components/now_mqtt/now_mqtt.cpp
+#    see https://community.home-assistant.io/t/consultation-on-the-usage-of-espnow-in-esphome/928005/33
+#    see https://ncrmnt.org/2021/12/06/optimizing-esp8266-esphome-for-battery-power-and-making-an-ice-bath-thermometer-as-well/
+
+# track output on listener:   journalctl  --since "1 min ago" -f -o short-precise  -u python_espnow_mqtt.service
+
+substitutions:
+   device: now56ai
+   thismacaddr: 24:EC:4A:27:18:9C
+   sensor_readings_count: 20          #### note 50 resulted in boot loop
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+# https://esphome.io/components/logger/#default-uart-gpio-pins
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+
+
+# Deep sleep component
+deep_sleep:
+  run_duration: 10s     # will be shortcut by on_boot process
+  sleep_duration: 300s
+  wakeup_pin:
+      number: GPIO7
+      allow_other_uses: true
+      mode:
+        input: true
+        pulldown: true     ### not strong enough, required  22K external pulldown
+
+
+# ESP-NOW component
+espnow:
+  auto_add_peer: true
+  channel: 1
+  peers:
+    - 00:14:d1:63:8c:3c      ### linux based espnow receiver  (dvr)
+
+uart:
+  - id: my_uart
+    baud_rate: 115200
+    tx_pin:
+      number: GPIO43
+    rx_pin:
+      number: GPIO44
+
+i2c:
+  sda: GPIO6
+  scl: GPIO5
+
+
+globals:
+   - id: sent
+     type: int
+     restore_value: no
+     initial_value: '0'
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO7
+      mode:
+        input: true
+        pulldown: true
+      allow_other_uses: true
+    name: "${device} motion 07"
+    id:    ${device}_motion_07
+    icon: mdi:motion-sensor
+    internal : true
+    device_class: motion
+    on_press:
+      then:
+        - logger.log: "${device} GPIO07 acted"
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] motion07 %2d \n", id(sent) , id(${device}_motion_07).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+
+# Sensor configuration
+sensor:
+  - platform: shtcx
+    address: 0x70
+    update_interval: 1s
+    temperature:
+      filters:
+        - lambda: return x * (9.0/5.0) + 32.0;
+      unit_of_measurement: "°F"
+      state_class: "measurement"
+      icon: mdi:thermometer
+      name: "${device} Temperature"
+      id:    ${device}_temperature
+      on_value:
+        then:
+          - lambda: id(sent)++;
+          - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] temp = %5.2f\n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+    humidity:
+      name: "${device} Humidity"
+      id:    ${device}_humidity
+      state_class: "measurement"
+      icon: mdi:water-percent
+      filters:
+        - filter_out: nan
+      on_value:
+        then:
+          - lambda: id(sent)++;
+          - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] humi = %5.2f \n", id(sent),  x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+  - platform: adc
+    pin: GPIO3
+    name: "${device} vdd"
+    id: "${device}_vdd"
+    attenuation: auto
+    state_class: "measurement"
+    icon: mdi:flash-outline
+    update_interval: never
+    filters:
+      - median:
+          window_size: ${sensor_readings_count}
+          send_every: ${sensor_readings_count}
+          send_first_at: ${sensor_readings_count}
+      - lambda: return x * 5.537 * 1.03759398 ;
+    on_value:
+      then:
+        - component.update: "${device}_battery"
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] adc = %5.2f \n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+### divider = 9850 over 2171  ( multiplier =  [ 2171 / ( 9850 + 2171)) = 0.1806 ]
+### divider = 4.14 over 3.99  ( multiplier =  [ 1.037  ]
+
+# https://community.home-assistant.io/t/esphome-battery-level-sensor/245196/19
+  - platform: template
+    name: "${device} Battery"
+    id:    ${device}_battery
+    lambda: return id(${device}_vdd).state;
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: "measurement"
+    icon: mdi:battery-medium
+    update_interval: never
+    filters:
+      - calibrate_linear:
+         method: exact
+         datapoints:
+          - 0.00 -> 0.0
+          - 3.30 -> 1.0
+          - 3.39 -> 10.0
+          - 3.75 -> 50.0
+          - 4.11 -> 90.0
+          - 4.20 -> 100.0
+      - lambda: |-
+          if (x <= 100) {
+            return x;
+          } else {
+            return 100;
+          }
+          if (x <0) {
+            return 0;
+          }
+    on_value:
+      then:
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] bat pct = %5.2f \n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+# Main automation to run on boot
+esphome:
+  name: ${device}
+  platformio_options:
+    build_flags: -DBOARD_HAS_PSRAM -DARDUINO_USB_CDC_ON_BOOT=1
+  on_boot:
+    # Manually trigger sensor updates on boot
+    - then:
+        - wait_until:           ### required because shtcx is not pollable
+            condition:
+              - lambda: 'return id(${device}_temperature).has_state();'
+        - repeat:
+            count: ${sensor_readings_count}
+            then:
+              - component.update: ${device}_vdd
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   >>>>> [%d] in on_boot at start  \n", id(sent) );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+        - espnow.send:
+            address: "00:14:d1:63:8c:3c"
+            data: !lambda |-
+                      char buf[160];
+                      int8_t accuracy = id(${device}_temperature)->get_accuracy_decimals();
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              id(${device}_temperature).get_device_class().c_str(),
+                              state_class_to_string( id(${device}_temperature)->get_state_class() ) ,
+                              str_snake_case( id(${device}_temperature).get_name() ).c_str() ,
+                              id(${device}_temperature).get_unit_of_measurement().c_str() ,
+                              value_accuracy_to_string(id(${device}_temperature).state, accuracy).c_str() ,
+                              id(${device}_temperature).get_icon().c_str(),
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] temp = %5.2f \n", id(sent), id(${device}_humidity).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+        - espnow.send:
+            address: "00:14:d1:63:8c:3c"
+            data: !lambda |-
+                      char buf[160];
+                      int8_t accuracy = id(${device}_humidity)->get_accuracy_decimals();
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              id(${device}_humidity).get_device_class().c_str(),
+                              state_class_to_string( id(${device}_humidity)->get_state_class() ) ,
+                              str_snake_case( id(${device}_humidity).get_name() ).c_str() ,
+                              id(${device}_humidity).get_unit_of_measurement().c_str() ,
+                              value_accuracy_to_string(id(${device}_humidity).state, accuracy).c_str() ,
+                              id(${device}_humidity).get_icon().c_str(),
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] humi = %5.2f \n", id(sent), id(${device}_humidity).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        - espnow.send:
+            address: "00:14:d1:63:8c:3c"
+            data: !lambda |-
+                      char buf[160];
+                      int8_t accuracy = id(${device}_vdd)->get_accuracy_decimals();
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              id(${device}_vdd).get_device_class().c_str(),
+                              state_class_to_string( id(${device}_vdd)->get_state_class() ) ,
+                              str_snake_case( id(${device}_vdd).get_name() ).c_str() ,
+                              id(${device}_vdd).get_unit_of_measurement().c_str() ,
+                              value_accuracy_to_string(id(${device}_vdd).state, accuracy).c_str() ,
+                              id(${device}_vdd).get_icon().c_str(),
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log:
+                 format: "ESPNow message vdd sent successfully"
+                 level: INFO
+                 tag: ESPNOW
+            on_error:
+              - logger.log: "ESPNow message vdd failed to send"
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] vdd  = %5.2f \n", id(sent), id(${device}_vdd).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        - espnow.send:
+            address: "00:14:d1:63:8c:3c"
+            data: !lambda |-
+                      char buf[160];
+                      int8_t accuracy = id(${device}_battery)->get_accuracy_decimals();
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              id(${device}_battery).get_device_class().c_str(),
+                              state_class_to_string( id(${device}_battery)->get_state_class() ) ,
+                              str_snake_case( id(${device}_battery).get_name() ).c_str() ,
+                              id(${device}_battery).get_unit_of_measurement().c_str() ,
+                              value_accuracy_to_string(id(${device}_battery).state, accuracy).c_str() ,
+                              id(${device}_battery).get_icon().c_str(),
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log:
+                 format: "ESPNow message battery sent successfully"
+                 level: INFO
+                 tag: ESPNOW
+            on_error:
+              - logger.log: "ESPNow message battery failed to send"
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] battery  = %5.2f \n", id(sent), id(${device}_battery).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        # Ensure the device has time to transmit before sleeping
+#        - delay: 5s
+        - deep_sleep.enter    #### shortcut to end since all work done ( save battery)
+
+
+
+##    first trials - logging from linux receiver -
+## pumps out the t sensors in 57.87 - 57.7 seconds === 0.17 seconds then back to sleep
+
+## Sep 21 14:31:57.705859 dvr python_espnow_mqtt[78649]: now56ai/sensor/now56ai_temperature/state
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]: ('{"dev_cla": "temperature", "unit_of_meas": "\\u00b0F", "stat_cla": '
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]:  '"measurement", "name": "now56ai_temperature", "icon": "mdi:thermometer", '
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]:  '"stat_t": "now56ai/sensor/now56ai_temperature/state", "uniq_id": '
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]:  '"24ec4a27189c_now56ai_temperature", "dev": {"ids": "24ec4a27189c", "name": '
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]:  '"now56ai", "sw": "2025.9.1", "mdl": "esp32-s3-devkitc-1", "mf": '
+## Sep 21 14:31:57.706440 dvr python_espnow_mqtt[78649]:  '"expressif"}}')
+## Sep 21 14:31:57.709583 dvr python_espnow_mqtt[78649]: ESP-NOW : 24:EC:4A:27:18:9C :  now56ai:temperature:measurement:now56ai_temperature:°F:75.0:mdi:thermometer:2025.9.1:esp32-s3-devkitc-1:sensor:
+## Sep 21 14:31:57.764082 dvr python_espnow_mqtt[78649]: now56ai/sensor/now56ai_humidity/state
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]: ('{"dev_cla": "humidity", "unit_of_meas": "%", "stat_cla": "measurement", '
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]:  '"name": "now56ai_humidity", "icon": "mdi:water-percent", "stat_t": '
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]:  '"now56ai/sensor/now56ai_humidity/state", "uniq_id": '
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]:  '"24ec4a27189c_now56ai_humidity", "dev": {"ids": "24ec4a27189c", "name": '
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]:  '"now56ai", "sw": "2025.9.1", "mdl": "esp32-s3-devkitc-1", "mf": '
+## Sep 21 14:31:57.764244 dvr python_espnow_mqtt[78649]:  '"expressif"}}')
+## Sep 21 14:31:57.767747 dvr python_espnow_mqtt[78649]: ESP-NOW : 24:EC:4A:27:18:9C :  now56ai:humidity:measurement:now56ai_humidity:%:61.6:mdi:water-percent:2025.9.1:esp32-s3-devkitc-1:sensor:
+## Sep 21 14:31:57.815996 dvr python_espnow_mqtt[78649]: now56ai/sensor/now56ai_vdd/state
+## Sep 21 14:31:57.816162 dvr python_espnow_mqtt[78649]: ('{"dev_cla": "voltage", "unit_of_meas": "V", "stat_cla": "measurement", '
+## Sep 21 14:31:57.816162 dvr python_espnow_mqtt[78649]:  '"name": "now56ai_vdd", "icon": "mdi:flash-outline", "stat_t": '
+## Sep 21 14:31:57.816162 dvr python_espnow_mqtt[78649]:  '"now56ai/sensor/now56ai_vdd/state", "uniq_id": "24ec4a27189c_now56ai_vdd", '
+## Sep 21 14:31:57.816162 dvr python_espnow_mqtt[78649]:  '"dev": {"ids": "24ec4a27189c", "name": "now56ai", "sw": "2025.9.1", "mdl": '
+## Sep 21 14:31:57.816162 dvr python_espnow_mqtt[78649]:  '"esp32-s3-devkitc-1", "mf": "expressif"}}')
+## Sep 21 14:31:57.819760 dvr python_espnow_mqtt[78649]: ESP-NOW : 24:EC:4A:27:18:9C :  now56ai:voltage:measurement:now56ai_vdd:V:5.15:mdi:flash-outline:2025.9.1:esp32-s3-devkitc-1:sensor:
+## Sep 21 14:31:57.871622 dvr python_espnow_mqtt[78649]: now56ai/sensor/now56ai_battery/state
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]: ('{"dev_cla": "battery", "unit_of_meas": "%", "stat_cla": "measurement", '
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]:  '"name": "now56ai_battery", "icon": "mdi:battery-medium", "stat_t": '
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]:  '"now56ai/sensor/now56ai_battery/state", "uniq_id": '
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]:  '"24ec4a27189c_now56ai_battery", "dev": {"ids": "24ec4a27189c", "name": '
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]:  '"now56ai", "sw": "2025.9.1", "mdl": "esp32-s3-devkitc-1", "mf": '
+## Sep 21 14:31:57.871775 dvr python_espnow_mqtt[78649]:  '"expressif"}}')
+## Sep 21 14:31:57.874862 dvr python_espnow_mqtt[78649]: ESP-NOW : 24:EC:4A:27:18:9C :  now56ai:battery:measurement:now56ai_battery:%:100:mdi:battery-medium:2025.9.1:esp32-s3-devkitc-1:sensor:
+##
