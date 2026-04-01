@@ -1,0 +1,452 @@
+
+
+#  modded to comform with api in esphome Version: 2026.3.1
+
+# see https://community.home-assistant.io/t/consultation-on-the-usage-of-espnow-in-esphome/928005/33
+# see https://ncrmnt.org/2021/12/06/optimizing-esp8266-esphome-for-battery-power-and-making-an-ice-bath-thermometer-as-well/
+
+# dvr:   journalctl  --since "1 min ago" -f -o short-precise  -u python_espnow_mqtt.service
+# 192.168.1.54             ether   34:b7:da:52:aa:7c   C                     eno1
+
+
+substitutions:
+   device: now54
+   thismacaddr: 34:b7:da:52:aa:7c
+   thatmacaddr: FF:FF:FF:FF:FF:FF     #### broadcast
+   sensor_readings_count: 20          #### note 50 resulted in boot loop
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+debug:
+
+# Enable logging
+logger:
+  level: VERBOSE
+  baud_rate: 115200
+  hardware_uart: UART0
+
+
+# Deep sleep component
+deep_sleep:
+  run_duration: 10s     # will be shortcut by on_boot process
+  sleep_duration: 1800s
+  wakeup_pin:
+      number: GPIO12
+      allow_other_uses: true
+      mode: INPUT_PULLDOWN
+
+
+# ESP-NOW component
+espnow:
+  auto_add_peer: true
+  channel: 1
+  peers:
+    - ${thatmacaddr}      ### linux based espnow receiver  (dvr)  NO BROADCAST
+
+uart:
+  - id: my_uart
+    baud_rate: 115200
+    tx_pin:
+      number: GPIO43
+    rx_pin:
+      number: GPIO44
+    debug:
+      direction: TX
+      dummy_receiver: false
+      debug_prefix: "[now54] "
+      after:
+        delimiter: "\n"
+      sequence:
+        - lambda: UARTDebug::log_string(direction, bytes, debug_prefix);
+
+i2c:
+  sda: GPIO6
+  scl: GPIO5
+  id: bus_a
+  frequency: 50khz
+  scan: false
+
+
+globals:
+   - id: sent
+     type: int
+     restore_value: no
+     initial_value: '0'
+
+   - id: data_to_send
+     type: std::string
+     restore_value: no
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO12
+      mode:
+        input: true
+        pulldown: true
+      allow_other_uses: true
+    name: "${device} motion 12"
+    id:    ${device}_motion_12
+    icon: mdi:motion-sensor
+    internal : true
+    device_class: motion
+    on_press:
+      then:
+        - logger.log: "${device} GPIO12 acted"
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   sensor [%d] motion12 %2d \n", id(sent) , id(${device}_motion_12).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: "${device}_light"
+    name: "${device} light"
+    pin: GPIO38
+    num_leds: 1
+#   rmt_channel: 0
+    rgb_order: RGB
+    chipset: ws2812
+
+
+# Sensor configuration
+sensor:
+  - platform: htu21d
+    model: htu21d
+    address: 0x40
+#   update_interval: 2s      ## was 1 sec but adding light made extra measurements happern
+    temperature:
+      filters:
+        - filter_out: nan
+        - lambda: return x * (9.0/5.0) + 32.0;
+      unit_of_measurement: "°F"
+      state_class: "measurement"
+      icon: mdi:thermometer
+      name: "${device} Temperature"
+      id:    ${device}_temperature
+      on_value:
+        then:
+          - lambda: id(sent)++;
+          - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   sensor [%d] temp = %5.2f\n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+    humidity:
+      name: "${device} Humidity"
+      id:    ${device}_humidity
+      state_class: "measurement" 
+      icon: mdi:water-percent
+      filters:
+        - filter_out: nan
+      on_value:
+        then:
+          - lambda: id(sent)++;
+          - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   sensor [%d] humi = %5.2f \n", id(sent),  x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+  - platform: adc
+    pin: GPIO3
+    name: "${device} vdd"
+    id: "${device}_vdd"
+    state_class: "measurement"
+    icon: mdi:flash-outline
+    attenuation: 6db
+    samples: 10
+    sampling_mode: avg
+    update_interval: never
+    filters:
+      - median: 
+          window_size: ${sensor_readings_count}
+          send_every: ${sensor_readings_count}
+          send_first_at: ${sensor_readings_count}
+      - lambda: return x *  7.8816 ;
+    on_value:
+      then:
+        - component.update: "${device}_battery"
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   sensor [%d] adc = %5.2f \n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+### divider = 9850 over 2171  ( multiplier =  [ 2171 / ( 9850 + 2171)) = 0.1806 ]
+### divider = 4.14 over 3.99  ( multiplier =  [ 1.037  ]
+
+# https://community.home-assistant.io/t/esphome-battery-level-sensor/245196/19
+  - platform: template
+    name: "${device} Battery"
+    id:    ${device}_battery
+    lambda: return id(${device}_vdd).state;
+    accuracy_decimals: 0
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: "measurement"
+    icon: mdi:battery-medium
+    update_interval: never
+    filters:
+      - calibrate_linear:
+         method: exact
+         datapoints:
+          - 0.00 -> 0.0
+          - 3.30 -> 1.0
+          - 3.39 -> 10.0
+          - 3.75 -> 50.0
+          - 4.11 -> 90.0
+          - 4.20 -> 100.0
+      - lambda: |-
+          if (x <= 100) {
+            return x;
+          } else {
+            return 100;
+          }
+          if (x <0) {
+            return 0;
+          }
+    on_value:
+      then:
+        - lambda: id(sent)++;
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   sensor [%d] bat pct = %5.2f \n", id(sent), x );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+# Main automation to run on boot
+esphome:
+  name: ${device}
+# platformio_options:
+#   build_flags: -DBOARD_HAS_PSRAM -DARDUINO_USB_CDC_ON_BOOT=1
+  on_boot:
+    # Manually trigger sensor updates on boot
+    - then:
+        - wait_until:           ### required because shtcx is not pollable
+            condition:
+              - lambda: 'return id(${device}_temperature).has_state();'
+        - repeat:
+            count: ${sensor_readings_count}
+            then:
+              - component.update: ${device}_vdd
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   ------ [%d] on_boot\n", id(sent) );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+        - uart.write: "${device} light on\n"
+        - light.turn_on:
+             id: ${device}_light
+             transition_length: 0.25s
+             red: 0.0
+             green: 0.5
+             blue: 0.0
+             brightness: 50%
+        - wait_until:
+            condition:
+              light.is_on: ${device}_light
+
+
+        - espnow.send:
+            address: ${thatmacaddr}
+            data: !lambda |-
+                      char buf[200];
+                      char device_class_buf[MAX_DEVICE_CLASS_LENGTH];    // new character buffer for class_to, etc
+                      auto temp_class = id(${device}_temperature).get_device_class_to(device_class_buf);
+                      auto uom = id(${device}_temperature).get_unit_of_measurement_ref();
+                      char accuracy_buf[VALUE_ACCURACY_MAX_LEN];
+                      int len = value_accuracy_to_buf(accuracy_buf, id(${device}_temperature).state , 1);
+                      char device_icon_buf[MAX_ICON_LENGTH];    // new character buffer for class_to, etc
+                      auto temp_icon = id(${device}_temperature).get_icon_to(device_icon_buf);
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              temp_class,
+                              state_class_to_string( id(${device}_temperature)->get_state_class() ) ,
+                              str_snake_case( id(${device}_temperature).get_name() ).c_str() ,
+                              uom.c_str() ,
+                              accuracy_buf,
+                              temp_icon,
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      id(data_to_send) = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log:
+                 format: "ESPNow message temp sent successfully"
+                 level: INFO
+                 tag: ESPNOW
+            on_error:
+              - logger.log: "ESPNow message temp failed to send"
+              - uart.write: "ESPNow message temp failed to send (uart)\n"
+              - uart.write:
+                  data: !lambda |-
+                    std::string cmd = "fail "+id(data_to_send) + "\n";
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] temp = %5.2f \n", id(sent), id(${device}_temperature).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        - espnow.send:
+            address: ${thatmacaddr}
+            data: !lambda |-
+                      char buf[200];
+                      char device_class_buf[MAX_DEVICE_CLASS_LENGTH];    // new character buffer for class_to, etc
+                      auto humi_class = id(${device}_humidity).get_device_class_to(device_class_buf);
+                      auto uom = id(${device}_humidity).get_unit_of_measurement_ref();
+                      char accuracy_buf[VALUE_ACCURACY_MAX_LEN];
+                      int len  = value_accuracy_to_buf(accuracy_buf, id(${device}_humidity).state , 1);
+                      char device_icon_buf[MAX_ICON_LENGTH];    // new character buffer for class_to, etc
+                      auto humi_icon = id(${device}_humidity).get_icon_to(device_icon_buf);
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              humi_class,
+                              state_class_to_string( id(${device}_humidity)->get_state_class() ) ,
+                              str_snake_case( id(${device}_humidity).get_name() ).c_str() ,
+                              uom.c_str() ,
+                              accuracy_buf,
+                              humi_icon,
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      id(data_to_send) = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log:
+                 format: "ESPNow message humi sent successfully"
+                 level: INFO
+                 tag: ESPNOW
+            on_error:
+              - logger.log: "ESPNow message humi failed to send"
+              - uart.write: "ESPNow message humi failed to send (uart)\n"
+              - uart.write:
+                  data: !lambda |-
+                    std::string cmd = "fail "+id(data_to_send) + "\n";
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] humi = %5.2f \n", id(sent), id(${device}_humidity).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        - espnow.send:
+            address: ${thatmacaddr}
+            data: !lambda |-
+                      char buf[200];
+                      char device_class_buf[MAX_DEVICE_CLASS_LENGTH];    // new character buffer for class_to, etc
+                      auto vdd_class = id(${device}_vdd).get_device_class_to(device_class_buf);
+                      auto uom = id(${device}_vdd).get_unit_of_measurement_ref();
+                      char accuracy_buf[VALUE_ACCURACY_MAX_LEN];
+                      int len = value_accuracy_to_buf(accuracy_buf, id(${device}_vdd).state , 1);
+                      char device_icon_buf[MAX_ICON_LENGTH];    // new character buffer for class_to, etc
+                      auto vdd_icon = id(${device}_vdd).get_icon_to(device_icon_buf);
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              vdd_class,
+                              state_class_to_string( id(${device}_vdd)->get_state_class() ) ,
+                              str_snake_case( id(${device}_vdd).get_name() ).c_str() ,
+                              uom.c_str(),
+                              accuracy_buf,
+                              vdd_icon,
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      id(data_to_send) = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log:
+                 format: "ESPNow message vdd sent successfully"
+                 level: INFO
+                 tag: ESPNOW
+            on_error:
+              - logger.log: "ESPNow message vdd failed to send"
+              - uart.write: "ESPNow message vdd failed to send (uart)\n"
+              - uart.write:
+                  data: !lambda |-
+                    std::string cmd = "fail "+id(data_to_send) + "\n";
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] vdd  = %5.2f \n", id(sent), id(${device}_vdd).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+
+        - espnow.send:
+            address: ${thatmacaddr}
+            wait_for_sent: true
+            data: !lambda |-
+                      char buf[200];
+                      char device_class_buf[MAX_DEVICE_CLASS_LENGTH];    // new character buffer for class_to, etc
+                      auto battery_class = id(${device}_battery).get_device_class_to(device_class_buf);
+                      auto uom = id(${device}_battery).get_unit_of_measurement_ref();
+                      char accuracy_buf[VALUE_ACCURACY_MAX_LEN];
+                      int len  = value_accuracy_to_buf(accuracy_buf, id(${device}_battery).state , 1);
+                      char device_icon_buf[MAX_ICON_LENGTH];    // new character buffer for class_to, etc
+                      auto battery_icon = id(${device}_battery).get_icon_to(device_icon_buf);
+                      sprintf(buf, "%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:",
+                              str_snake_case( App.get_name() ).c_str() ,
+                              battery_class,
+                              state_class_to_string( id(${device}_battery)->get_state_class() ) ,
+                              str_snake_case( id(${device}_battery).get_name() ).c_str() ,
+                              uom.c_str(),
+                              accuracy_buf,
+                              battery_icon,
+                              ESPHOME_VERSION,
+                              ESPHOME_BOARD,
+                              "sensor"
+                              );
+                      std::string s = buf;
+                      id(data_to_send) = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+            on_sent:
+              - logger.log: "ESPNow message battery sent successfully"
+              - uart.write: "ESPNow message battery sent successfully (uart)\n"
+              - uart.write:
+                  data: !lambda |-
+                    std::string cmd = "sent " + id(data_to_send) + "\n";
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+            on_error:
+              - logger.log: "ESPNow message battery failed to send"
+              - uart.write: "ESPNow message battery failed to send (uart)\n"
+              - uart.write:
+                  data: !lambda |-
+                    std::string cmd = "fail "+id(data_to_send) + "\n";
+                    return std::vector<uint8_t>(cmd.begin(), cmd.end());
+        - uart.write: !lambda
+                      char buf[128];
+                      sprintf(buf, "   espnow [%d] battery  = %5.2f \n", id(sent), id(${device}_battery).state );
+                      std::string s = buf;
+                      return std::vector<unsigned char>( s.begin(), s.end() );
+
+
+        - uart.write: "${device} light off\n"
+        - light.turn_off: ${device}_light
+        - wait_until:
+            condition:
+              light.is_off: ${device}_light
+
+        - deep_sleep.enter    #### shortcut to end since all work done ( save battery)
+
+
+
